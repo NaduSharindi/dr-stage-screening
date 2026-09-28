@@ -18,28 +18,37 @@ import cv2
 import streamlit as st
 import keras
 
+import importlib
 import dr_core as core
+core = importlib.reload(core)        # always use the latest dr_core.py after a redeploy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 st.set_page_config(page_title="DR Stage Screening", page_icon="👁️", layout="wide")
 
 
+def _mtime(name):
+    return os.path.getmtime(os.path.join(BASE_DIR, name))
+
+
 @st.cache_resource(show_spinner="Loading the model ...")
-def load_resources():
-    """Load config and model once; Streamlit keeps them in memory between users."""
+def load_resources(config_mtime, model_mtime):
+    """Load config and model once; Streamlit keeps them in memory between users.
+    The file modification times are part of the cache key, so a redeployed
+    model/config is loaded automatically instead of the old cached one."""
     with open(os.path.join(BASE_DIR, "config.json")) as f:
         cfg = json.load(f)
     model = keras.models.load_model(os.path.join(BASE_DIR, "dr_model.keras"), compile=False)
     return cfg, model
 
 
-CFG, MODEL = load_resources()
+CFG, MODEL = load_resources(_mtime("config.json"), _mtime("dr_model.keras"))
 PREPROCESS = core.get_preprocess_fn(CFG["backbone"])
 CLASS_NAMES = CFG["class_names"]
 DISCLAIMER = ("**Disclaimer:** research and education prototype built for a university coursework. "
               "It is NOT a medical device and must not be used for diagnosis. "
               "Always consult a qualified eye-care professional.")
-# ---- streamlit_app.py part 2 ----
+
+
 def analyze(image):
     """Run the full screening pipeline on one RGB uint8 image. Returns a result dict."""
     is_fundus, warnings, qm = core.quality_gate(image, CFG["quality_thresholds"])
@@ -72,7 +81,8 @@ def make_report(r):
     lines += [f"  - {x}" for x in r["reasons"]]
     lines += ["", "Not a medical device. For research/education only."]
     return "\n".join(lines)
-# ---- streamlit_app.py part 3 ----
+
+
 # ------------------------------- user interface ------------------------------
 st.title("👁️ Diabetic Retinopathy Stage Screening")
 tm = CFG.get("test_metrics", {})
