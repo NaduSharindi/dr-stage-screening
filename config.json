@@ -1,0 +1,32 @@
+{
+  "backbone": "MobileNetV2",
+  "img_size": 224,
+  "class_names": [
+    "No DR",
+    "Mild",
+    "Moderate",
+    "Severe",
+    "Proliferative DR"
+  ],
+  "conv_layer": "out_relu",
+  "fusion_w": 0.8,
+  "entropy_threshold": 0.8046477516556845,
+  "input_mode": "enhanced",
+  "referable_threshold": 0.49808874279252385,
+  "mc_samples": 5,
+  "quality_thresholds": {
+    "coverage_min": 0.3793690185546875,
+    "red_ratio_min": 0.949179411403061,
+    "brightness_min": 37.53718799201453,
+    "brightness_max": 129.83017908216996,
+    "sharpness_min": 17.938928279332025,
+    "contrast_min": 9.461680016189831
+  },
+  "test_metrics": {
+    "acc": 0.8087954110898662,
+    "macro_f1": 0.6585925608728401,
+    "qwk": 0.8892715493514376
+  },
+  "dataset": "APTOS 2019 Blindness Detection (Kaggle)",
+  "created": "2026-09-28 12:05"
+}
