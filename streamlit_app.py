@@ -1,13 +1,3 @@
-"""
-streamlit_app.py - Cloud-deployed Diabetic Retinopathy screening prototype
-Hosted free on Streamlit Community Cloud (from a GitHub repository).
-Research/education prototype only - NOT a medical device.
-
-Pipeline for every uploaded image:
-  quality gate -> same preprocessing as training (dr_core) -> multi-task CNN
-  with TTA + Monte-Carlo dropout -> fused stage probabilities -> uncertainty
-  -> Grad-CAM explanation -> triage decision -> downloadable report
-"""
 import os
 import json
 import datetime
