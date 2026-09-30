@@ -10,7 +10,7 @@ import keras
 
 import importlib
 import dr_core as core
-core = importlib.reload(core)        # always use the latest dr_core.py after a redeploy
+core = importlib.reload(core)        
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 st.set_page_config(page_title="DR Stage Screening", page_icon="👁️", layout="wide")
@@ -22,9 +22,7 @@ def _mtime(name):
 
 @st.cache_resource(show_spinner="Loading the model ...")
 def load_resources(config_mtime, model_mtime):
-    """Load config and model once; Streamlit keeps them in memory between users.
-    The file modification times are part of the cache key, so a redeployed
-    model/config is loaded automatically instead of the old cached one."""
+    
     with open(os.path.join(BASE_DIR, "config.json")) as f:
         cfg = json.load(f)
     model = keras.models.load_model(os.path.join(BASE_DIR, "dr_model.keras"), compile=False)
@@ -40,7 +38,7 @@ DISCLAIMER = ("**Disclaimer:** research and education prototype built for a univ
 
 
 def analyze(image):
-    """Run the full screening pipeline on one RGB uint8 image. Returns a result dict."""
+    
     is_fundus, warnings, qm = core.quality_gate(image, CFG["quality_thresholds"])
     if not is_fundus:
         return {"rejected": True, "quality": qm}
@@ -73,7 +71,7 @@ def make_report(r):
     return "\n".join(lines)
 
 
-# ------------------------------- user interface ------------------------------
+
 st.title("👁️ Diabetic Retinopathy Stage Screening")
 tm = CFG.get("test_metrics", {})
 st.caption(f"Transfer-learning **{CFG['backbone']}** with multi-task heads (stage + binary + ordinal), "
