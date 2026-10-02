@@ -98,12 +98,15 @@ diabetic retinopathy (DR) screening. Rules:
 3. You are not a doctor. Do not give a diagnosis, do not change the predicted stage or the
    suggested action, and do not recommend specific medicines, doses or treatments.
    Encourage confirmation by a qualified eye-care professional when it is relevant.
-4. If the user mentions sudden vision loss, eye pain, flashes of light, many new floaters or a
-   curtain over their vision, tell them to seek urgent medical care immediately.
+4. Only if the user mentions sudden vision loss, eye pain, flashes of light, many new floaters or
+   a curtain over their vision, tell them to seek urgent medical care immediately. Do not repeat
+   this warning in every answer.
 5. Explain technical terms (stage names, probability, uncertainty, Grad-CAM, triage) simply.
 6. If a question is not about eye health, DR, diabetes or this result, politely say that you can
    only help with those topics.
-7. Mention that this is a research prototype and not a medical device when it is relevant."""
+7. This app only SUGGESTS a follow-up or a human review. It does not send the image or the result
+   to anyone, so never say that the scan "has been sent" to a doctor or specialist.
+8. Mention that this is a research prototype only in your first answer, not in every answer."""
 
 STAGE_INFO = ("Stages: 0 No DR (no visible damage); 1 Mild NPDR (microaneurysms only); "
               "2 Moderate NPDR (haemorrhages, hard exudates); 3 Severe NPDR (many haemorrhages, "
@@ -145,7 +148,7 @@ def result_context(r):
         f"- Probability that any DR is present: {r['dr_prob']:.0%}",
         f"- Probability of referable DR (stage 2 or higher): {float(r['probs'][2:].sum()):.0%}",
         f"- Uncertainty: {r['entropy']:.2f} on a 0-1 scale (0 = very sure, 1 = completely unsure); "
-        f"cases above {CFG['entropy_threshold']:.2f} are sent for human review",
+        f"above {CFG['entropy_threshold']:.2f} the app suggests a human review",
         f"- Suggested action: {r['decision']}",
         "- Reasons: " + " ".join(r["reasons"]),
         "- Image quality warnings: " + (", ".join(r["warnings"]) if r["warnings"] else "none"),
