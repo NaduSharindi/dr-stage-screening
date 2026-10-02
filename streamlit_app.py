@@ -121,8 +121,12 @@ def get_secret(name, default=None):
 
 
 @st.cache_resource
-def get_chat_client(api_key):
+def get_chat_client(api_key, vertex=False):
+    """Gemini client. Google AI Studio keys ('AQ.' authorization keys or older 'AIza' keys) use the
+    Gemini API; vertex=True is only a fallback for Vertex AI express-mode keys."""
     from google import genai
+    if vertex:
+        return genai.Client(vertexai=True, api_key=api_key)
     return genai.Client(api_key=api_key)
 
 
@@ -192,6 +196,9 @@ def explain_error(e):
     text, code = str(e), getattr(e, "code", None)
     if "API_KEY_INVALID" in text or "API key not valid" in text:
         return "The API key is not valid. Please check GEMINI_API_KEY in the app secrets."
+    if code == 401 or "UNAUTHENTICATED" in text or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in text:
+        return ("The API key was rejected (401). Make sure requirements.txt asks for a recent google-genai "
+                "version and that the key was copied completely.")
     if code == 403 or "PERMISSION_DENIED" in text:
         return "This API key is not allowed to use Gemini (permission denied)."
     if code == 429 or "RESOURCE_EXHAUSTED" in text:
@@ -202,8 +209,12 @@ def explain_error(e):
 def ask_assistant(question, history, r):
     """Send the question, the recent conversation and the result context to Gemini."""
     from google.genai import types
-    api_key = get_secret("GEMINI_API_KEY")
-    client = get_chat_client(api_key)
+    api_key = (get_secret("GEMINI_API_KEY") or "").strip()
+    # AI Studio now issues "AQ." authorization keys for the normal Gemini API, so the Gemini API is
+    # always tried first; Vertex AI express mode is only a fallback if the key is rejected
+    modes = [False, True]
+    if "client_mode" in st.session_state:
+        modes = [st.session_state["client_mode"]]
     contents = [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
                 for m in history[-10:]]                 # last 5 question/answer pairs only
     contents.append({"role": "user", "parts": [{"text": question}]})
@@ -214,13 +225,38 @@ def ask_assistant(question, history, r):
     candidates = [st.session_state.get("working_model"), get_secret("GEMINI_MODEL")] + PREFERRED_MODELS
     candidates = [m for i, m in enumerate(candidates) if m and m not in candidates[:i]]
     last_error = None
+    base_candidates = candidates
+    for vertex in modes:
+        client = get_chat_client(api_key, vertex)
+        candidates = base_candidates
+        result = _try_models(client, api_key, vertex, candidates, contents, config)
+        if result is not None and result[0] == "ok":
+            st.session_state["client_mode"] = vertex
+            return result[1]
+        last_error = result[1] if result else last_error
+        # only an authentication / key problem is a reason to try the other key type
+        if not _is_key_error(last_error):
+            break
+    return explain_error(last_error) if last_error else "Sorry, no Gemini model is available for this key."
+
+
+def _is_key_error(e):
+    text = str(e)
+    return e is not None and (getattr(e, "code", None) in (400, 401, 403)
+                              and ("API_KEY" in text or "API key" in text or "UNAUTHENTICATED" in text
+                                   or "PERMISSION_DENIED" in text or "CREDENTIALS" in text.upper()))
+
+
+def _try_models(client, api_key, vertex, candidates, contents, config):
+    """Try the candidate models with one client. Returns ("ok", answer) or ("error", exception)."""
+    last_error = None
     for attempt in (1, 2):
         for model in candidates:
             try:
                 resp = client.models.generate_content(model=model, contents=contents, config=config)
                 st.session_state["working_model"] = model
                 answer = (resp.text or "").strip()
-                return answer or "Sorry, I could not create an answer. Please try asking in a different way."
+                return ("ok", answer or "Sorry, I could not create an answer. Please try asking in a different way.")
             except Exception as e:
                 print(f"Gemini error with model {model}:", repr(e))      # visible in 'Manage app' -> logs
                 last_error = e
@@ -228,13 +264,13 @@ def ask_assistant(question, history, r):
                 # a wrong / retired model name or a model without free quota -> try the next one
                 if getattr(e, "code", None) == 404 or "NOT_FOUND" in text or "limit: 0" in text:
                     continue
-                return explain_error(e)
-        if attempt == 1:                                 # none worked: ask Google which models exist
+                return ("error", e)
+        if attempt == 1 and not vertex:                  # none worked: ask Google which models exist
             extra = [m for m in discover_flash_models(api_key) if m not in candidates]
             if not extra:
                 break
             candidates = extra
-    return explain_error(last_error) if last_error else "Sorry, no Gemini model is available for this key."
+    return ("error", last_error) if last_error else None
 
 
 # ------------------------------- user interface ------------------------------
