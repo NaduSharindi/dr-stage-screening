@@ -12,7 +12,8 @@ import os
 import json
 import datetime
 import hashlib
-import sys
+import html
+import time
 
 import numpy as np
 import pandas as pd
@@ -87,8 +88,7 @@ def make_report(r):
 
 # ------------------------------- AI assistant (Gemini) ----------------------
 # The assistant only receives the NUMBERS of the current result (never the image),
-# and strict instructions so it explains the result instead of diagnosing.
-CHAT_MODEL_DEFAULT = "gemini-2.5-flash"
+# plus strict instructions so it explains the result instead of diagnosing.
 SYSTEM_PROMPT = """You are a friendly assistant inside a university research prototype for
 diabetic retinopathy (DR) screening. Rules:
 1. Explain the screening result below in simple, clear language for a patient or a health worker.
@@ -110,6 +110,10 @@ STAGE_INFO = ("Stages: 0 No DR (no visible damage); 1 Mild NPDR (microaneurysms 
               "venous beading); 4 Proliferative DR (new abnormal vessels, highest risk). "
               "Stage 2 or higher is called referable DR.")
 
+# models tried in this order; Google retires old names, so the app also asks Google which exist
+PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest",
+                    "gemini-flash-lite-latest"]
+
 
 def get_secret(name, default=None):
     """Read a setting from Streamlit secrets (cloud) or environment variables (local)."""
@@ -122,7 +126,7 @@ def get_secret(name, default=None):
 
 @st.cache_resource
 def get_chat_client(api_key, vertex=False):
-    """Gemini client. Google AI Studio keys ('AQ.' authorization keys or older 'AIza' keys) use the
+    """Gemini client. AI Studio keys ('AQ.' authorization keys or older 'AIza' keys) use the
     Gemini API; vertex=True is only a fallback for Vertex AI express-mode keys."""
     from google import genai
     if vertex:
@@ -132,6 +136,7 @@ def get_chat_client(api_key, vertex=False):
 
 def result_context(r):
     """Plain-text summary of the current result that is given to the assistant."""
+    tm = CFG.get("test_metrics", {})
     probs = ", ".join(f"{n} {p:.0%}" for n, p in zip(CLASS_NAMES, r["probs"]))
     return "\n".join([
         "CURRENT SCREENING RESULT (from the CNN model):",
@@ -148,30 +153,6 @@ def result_context(r):
         f"QWK {tm.get('qwk', 0):.2f}. Grad-CAM shows the retina regions that influenced the prediction.",
         STAGE_INFO,
     ])
-
-
-# models are tried in this order until one works; the "latest" aliases always point to
-# Google's current Flash models, so the app keeps working when old model names are retired
-FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
-
-
-def friendly_error(err):
-    """Turn a Gemini error into a short message the user can act on."""
-    e = str(err)
-    if "API_KEY_INVALID" in e or "API key not valid" in e:
-        return "The API key is not valid. Please check GEMINI_API_KEY in the app secrets."
-    if "429" in e or "RESOURCE_EXHAUSTED" in e:
-        return "The free usage limit was reached. Please wait a minute and try again."
-    if "PERMISSION_DENIED" in e or "403" in e:
-        return "The API key has no permission for the Gemini API (check the key's project in Google AI Studio)."
-    if "location is not supported" in e.lower() or "FAILED_PRECONDITION" in e:
-        return "The Gemini API is not available for this key's region or project."
-    return "The assistant could not be reached right now. Please try again in a moment."
-
-
-# models tried in this order (Google retires model names over time, so there is a fallback)
-PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest",
-                    "gemini-flash-lite-latest", "gemini-2.0-flash"]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -191,80 +172,65 @@ def discover_flash_models(api_key):
         return []
 
 
-def explain_error(e):
-    """Turn an API error into a short, understandable message (full error goes to the logs)."""
-    text, code = str(e), getattr(e, "code", None)
-    if "API_KEY_INVALID" in text or "API key not valid" in text:
-        return "The API key is not valid. Please check GEMINI_API_KEY in the app secrets."
-    if code == 401 or "UNAUTHENTICATED" in text or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in text:
-        return ("The API key was rejected (401). Make sure requirements.txt asks for a recent google-genai "
-                "version and that the key was copied completely.")
-    if code == 403 or "PERMISSION_DENIED" in text:
-        return "This API key is not allowed to use Gemini (permission denied)."
-    if code == 429 or "RESOURCE_EXHAUSTED" in text:
-        return "The assistant is busy right now (free usage limit reached). Please try again in a minute."
-    return f"Sorry, the assistant is not available at the moment (error {code or 'unknown'})."
+def _code(e):
+    return getattr(e, "code", None)
 
 
-def ask_assistant(question, history, r):
-    """Send the question, the recent conversation and the result context to Gemini."""
-    from google.genai import types
-    api_key = (get_secret("GEMINI_API_KEY") or "").strip()
-    # AI Studio now issues "AQ." authorization keys for the normal Gemini API, so the Gemini API is
-    # always tried first; Vertex AI express mode is only a fallback if the key is rejected
-    modes = [False, True]
-    if "client_mode" in st.session_state:
-        modes = [st.session_state["client_mode"]]
-    contents = [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
-                for m in history[-10:]]                 # last 5 question/answer pairs only
-    contents.append({"role": "user", "parts": [{"text": question}]})
-    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT + "\n\n" + result_context(r),
-                                         temperature=0.3, max_output_tokens=1024)
+def _is_temporary(e):
+    """Server overloaded (500/503) - usually disappears after a few seconds."""
+    t = str(e)
+    return _code(e) in (500, 502, 503, 504) or "UNAVAILABLE" in t or "overloaded" in t.lower()
 
-    # the model that worked last time first, then the configured one, preferred ones and discovered ones
-    candidates = [st.session_state.get("working_model"), get_secret("GEMINI_MODEL")] + PREFERRED_MODELS
-    candidates = [m for i, m in enumerate(candidates) if m and m not in candidates[:i]]
-    last_error = None
-    base_candidates = candidates
-    for vertex in modes:
-        client = get_chat_client(api_key, vertex)
-        candidates = base_candidates
-        result = _try_models(client, api_key, vertex, candidates, contents, config)
-        if result is not None and result[0] == "ok":
-            st.session_state["client_mode"] = vertex
-            return result[1]
-        last_error = result[1] if result else last_error
-        # only an authentication / key problem is a reason to try the other key type
-        if not _is_key_error(last_error):
-            break
-    return explain_error(last_error) if last_error else "Sorry, no Gemini model is available for this key."
+
+def _is_model_problem(e):
+    """Wrong/retired model name or no free quota for this model - try another model."""
+    t = str(e)
+    return _code(e) == 404 or "NOT_FOUND" in t or "limit: 0" in t
 
 
 def _is_key_error(e):
-    text = str(e)
-    return e is not None and (getattr(e, "code", None) in (400, 401, 403)
-                              and ("API_KEY" in text or "API key" in text or "UNAUTHENTICATED" in text
-                                   or "PERMISSION_DENIED" in text or "CREDENTIALS" in text.upper()))
+    t = str(e)
+    return e is not None and _code(e) in (400, 401, 403) and (
+        "API_KEY" in t or "API key" in t or "UNAUTHENTICATED" in t or "PERMISSION_DENIED" in t)
+
+
+def explain_error(e):
+    """Turn an API error into a short, understandable message (full error goes to the logs)."""
+    t, code = str(e), _code(e)
+    if "API_KEY_INVALID" in t or "API key not valid" in t:
+        return "The API key is not valid. Please check GEMINI_API_KEY in the app secrets."
+    if code == 401 or "UNAUTHENTICATED" in t:
+        return ("The API key was rejected (401). Make sure requirements.txt asks for google-genai>=2.27.0 "
+                "and that the key was copied completely.")
+    if code == 403 or "PERMISSION_DENIED" in t:
+        return "This API key is not allowed to use Gemini (permission denied)."
+    if _is_temporary(e):
+        return "Google's AI service is very busy right now. Please wait a few seconds and ask again."
+    if code == 429 or "RESOURCE_EXHAUSTED" in t:
+        return "The free usage limit was reached. Please wait a minute and ask again."
+    return f"Sorry, the assistant is not available at the moment (error {code or 'unknown'})."
 
 
 def _try_models(client, api_key, vertex, candidates, contents, config):
-    """Try the candidate models with one client. Returns ("ok", answer) or ("error", exception)."""
+    """Try the candidate models with one client. Returns ("ok", answer), ("error", e) or None."""
     last_error = None
     for attempt in (1, 2):
         for model in candidates:
-            try:
-                resp = client.models.generate_content(model=model, contents=contents, config=config)
-                st.session_state["working_model"] = model
-                answer = (resp.text or "").strip()
-                return ("ok", answer or "Sorry, I could not create an answer. Please try asking in a different way.")
-            except Exception as e:
-                print(f"Gemini error with model {model}:", repr(e))      # visible in 'Manage app' -> logs
-                last_error = e
-                text = str(e)
-                # a wrong / retired model name or a model without free quota -> try the next one
-                if getattr(e, "code", None) == 404 or "NOT_FOUND" in text or "limit: 0" in text:
-                    continue
-                return ("error", e)
+            for retry in range(2):                       # every model: first try + one retry
+                try:
+                    resp = client.models.generate_content(model=model, contents=contents, config=config)
+                    st.session_state["working_model"] = model
+                    answer = (resp.text or "").strip()
+                    return ("ok", answer or "Sorry, I could not create an answer. Please ask in a different way.")
+                except Exception as e:
+                    print(f"Gemini error with model {model}:", repr(e))   # visible in 'Manage app' -> logs
+                    last_error = e
+                    if _is_temporary(e) and retry == 0:
+                        time.sleep(2)                    # busy server: wait a moment, retry once
+                        continue
+                    if _is_temporary(e) or _is_model_problem(e) or _code(e) == 429:
+                        break                            # still busy / wrong model / no quota: next model
+                    return ("error", e)                  # e.g. key problem: stop here
         if attempt == 1 and not vertex:                  # none worked: ask Google which models exist
             extra = [m for m in discover_flash_models(api_key) if m not in candidates]
             if not extra:
@@ -273,23 +239,102 @@ def _try_models(client, api_key, vertex, candidates, contents, config):
     return ("error", last_error) if last_error else None
 
 
+def ask_assistant(question, history, r):
+    """Send the question, the recent conversation and the result context to Gemini."""
+    from google.genai import types
+    api_key = (get_secret("GEMINI_API_KEY") or "").strip()
+    modes = [st.session_state["client_mode"]] if "client_mode" in st.session_state else [False, True]
+    contents = [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
+                for m in history[-10:]]                 # last 5 question/answer pairs only
+    contents.append({"role": "user", "parts": [{"text": question}]})
+    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT + "\n\n" + result_context(r),
+                                         temperature=0.3, max_output_tokens=1024)
+    candidates = [st.session_state.get("working_model"), get_secret("GEMINI_MODEL")] + PREFERRED_MODELS
+    candidates = [m for i, m in enumerate(candidates) if m and m not in candidates[:i]]
+    last_error = None
+    for vertex in modes:
+        result = _try_models(get_chat_client(api_key, vertex), api_key, vertex, candidates, contents, config)
+        if result and result[0] == "ok":
+            st.session_state["client_mode"] = vertex
+            return result[1]
+        last_error = result[1] if result else last_error
+        if not _is_key_error(last_error):                # only a key problem -> try the other key type
+            break
+    return explain_error(last_error) if last_error else "Sorry, no Gemini model is available for this key."
+
+
 # ------------------------------- user interface ------------------------------
-st.title("Diabetic Retinopathy Stage Screening")
+# colour of every stage: green (healthy) -> red (most severe)
+STAGE_COLORS = ["#2e7d32", "#7cb342", "#f9a825", "#ef6c00", "#c62828"]
+STAGE_TEXT = ["No signs of diabetic retinopathy were found.",
+              "Very early changes (tiny bulges in small vessels) may be present.",
+              "Clear signs of retinal damage are visible; an eye specialist should review it.",
+              "Many signs of damage are visible; prompt specialist care is needed.",
+              "The most advanced stage, with abnormal new vessels; urgent specialist care is needed."]
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1.5rem; max-width: 1250px;}
+[data-testid="stSidebar"] {background: linear-gradient(180deg, #e8f4fd 0%, #f3ecfd 100%);}
+.hero {background: linear-gradient(120deg, #0f766e 0%, #2563eb 60%, #7c3aed 100%);
+       color: #ffffff; padding: 26px 30px; border-radius: 18px; margin-bottom: 18px;
+       box-shadow: 0 6px 18px rgba(37, 99, 235, 0.18);}
+.hero h1 {color: #ffffff; margin: 0 0 6px 0; padding: 0; font-size: 2.1rem;}
+.hero p {color: #e0f2fe; margin: 0; font-size: 1.05rem;}
+.steps {display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap;}
+.steps span {background: rgba(255,255,255,0.18); color: #ffffff; padding: 6px 14px;
+             border-radius: 999px; font-size: 0.95rem;}
+.sec {display: flex; align-items: center; gap: 10px; margin: 6px 0 12px 0;
+      font-size: 1.3rem; font-weight: 700; color: #1e293b;}
+.sec b {background: #2563eb; color: #ffffff; width: 32px; height: 32px; border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center; font-size: 1rem;}
+.card {border-radius: 16px; padding: 18px 20px; margin-bottom: 14px; color: #1e293b;
+       background: #ffffff; box-shadow: 0 2px 10px rgba(15,23,42,0.08);}
+.stage-name {font-size: 1.7rem; font-weight: 800; margin: 2px 0;}
+.muted {color: #64748b; font-size: 0.9rem;}
+.tiles {display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0 2px 0;}
+.tile {border-radius: 12px; padding: 10px 12px; background: #f8fafc; border: 1px solid #e2e8f0;}
+.tile .t {color: #64748b; font-size: 0.82rem;}
+.tile .v {font-size: 1.25rem; font-weight: 700;}
+.bar-row {display: flex; align-items: center; gap: 10px; margin: 7px 0;}
+.bar-label {width: 150px; font-size: 0.9rem; color: #334155;}
+.bar-track {flex: 1; background: #eef2f7; border-radius: 999px; height: 14px; overflow: hidden;}
+.bar-fill {height: 100%; border-radius: 999px;}
+.bar-pct {width: 46px; text-align: right; font-size: 0.9rem; font-weight: 600; color: #334155;}
+.action {border-radius: 14px; padding: 14px 18px; margin: 4px 0 14px 0; border-left: 6px solid; color: #1e293b;}
+.action h4 {margin: 0 0 6px 0; padding: 0;}
+.action ul {margin: 6px 0 0 0; padding-left: 20px;}
+.stButton > button, .stDownloadButton > button {border-radius: 999px; border: 1.5px solid #2563eb;
+       color: #1d4ed8; background: #eff6ff; font-weight: 600;}
+.stButton > button:hover, .stDownloadButton > button:hover {background: #2563eb; color: #ffffff;}
+[data-testid="stFileUploader"] section {background: #f0f9ff; border: 2px dashed #7dd3fc; border-radius: 14px;}
+</style>
+""", unsafe_allow_html=True)
+
 tm = CFG.get("test_metrics", {})
-st.markdown("Check a retinal (fundus) photo for signs of diabetic retinopathy in three simple steps: "
-            "**1. choose an image**, **2. read the result**, **3. ask questions** about it.")
-with st.expander("About the model"):
-    st.markdown(f"Transfer-learning **{CFG['backbone']}** network with three outputs (stage, DR yes/no and "
-                "stage order), trained on the APTOS 2019 dataset. Each image is checked 20 times "
-                "(4 flips x Monte-Carlo dropout) to measure how sure the model is, and Grad-CAM shows where "
-                f"it looked. Test results: accuracy **{tm.get('acc', float('nan')):.3f}**, "
-                f"macro-F1 **{tm.get('macro_f1', float('nan')):.3f}**, QWK **{tm.get('qwk', float('nan')):.3f}**.")
+st.markdown("""
+<div class="hero">
+  <h1>Diabetic Retinopathy Screening</h1>
+  <p>Check a retinal (fundus) photo for signs of diabetic eye disease and get an easy-to-understand result.</p>
+  <div class="steps"><span>1&nbsp; Choose an image</span><span>2&nbsp; Read the result</span>
+  <span>3&nbsp; Ask the assistant</span></div>
+</div>""", unsafe_allow_html=True)
+
+
+def section(num, title):
+    st.markdown(f'<div class="sec"><b>{num}</b>{title}</div>', unsafe_allow_html=True)
+
 
 with st.sidebar:
     st.header("How it works")
     st.markdown("1. Image-quality check\n2. Image enhancement (CLAHE, mask-aware Ben Graham)\n"
                 "3. CNN prediction with uncertainty\n4. Suggested follow-up (triage)\n"
                 "5. Grad-CAM explanation\n6. AI assistant explains the result")
+    with st.expander("About the model"):
+        st.markdown(f"Transfer-learning **{CFG['backbone']}** with three outputs (stage, DR yes/no, stage order), "
+                    "trained on APTOS 2019. Each image is checked 20 times (4 flips x Monte-Carlo dropout) "
+                    f"to measure certainty.\n\nTest accuracy **{tm.get('acc', float('nan')):.3f}**, "
+                    f"macro-F1 **{tm.get('macro_f1', float('nan')):.3f}**, QWK **{tm.get('qwk', float('nan')):.3f}**.")
     st.markdown(DISCLAIMER)
 
 ex_dir = os.path.join(BASE_DIR, "examples")
@@ -297,7 +342,7 @@ examples = sorted(os.listdir(ex_dir)) if os.path.isdir(ex_dir) else []
 
 col_in, col_out = st.columns([1, 1.3], gap="large")
 with col_in:
-    st.subheader("1. Choose an image")
+    section(1, "Choose an image")
     uploaded = st.file_uploader("Upload a colour fundus photo (PNG or JPG)", type=["png", "jpg", "jpeg"])
     example = st.selectbox("Or try an example image", ["(none)"] + examples)
     image = None
@@ -311,7 +356,7 @@ with col_in:
         st.image(image, caption="Your image", width="stretch")
 
 with col_out:
-    st.subheader("2. Result")
+    section(2, "Result")
     if image is None:
         st.info("Upload an image or pick an example on the left to see the result here.")
     else:
@@ -329,25 +374,52 @@ with col_out:
                      "Please upload a colour photo of the back of the eye.\n\n"
                      f"Details: retina area {q['coverage']:.0%}, red/blue ratio {q['red_ratio']:.2f}.")
         else:
-            with st.container(border=True):
-                st.markdown(f"#### Predicted stage: {CLASS_NAMES[r['stage']]}")
-                st.caption(f"Model confidence for this stage: {r['probs'][r['stage']]:.0%}")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Signs of DR", "Yes" if r["dr_prob"] >= 0.5 else "No",
-                          help=f"Probability that any DR is present: {r['dr_prob']:.0%}")
-                m2.metric("Uncertainty", f"{r['entropy']:.2f}",
-                          help=f"0 = very sure, 1 = completely unsure. Above {CFG['entropy_threshold']:.2f} "
-                               "the case is sent for human review.")
-                m3.metric("Image quality", "Good" if not r["warnings"] else "Check",
-                          help="; ".join(r["warnings"]) if r["warnings"] else "No quality problems found.")
-            box = st.warning if "REVIEW" in r["decision"] or "urgent" in r["decision"] else st.success
-            box(f"**Suggested action:** {r['decision'].replace(' + HUMAN GRADER REVIEW', '')}"
-                + (" - please have this checked by a specialist" if "REVIEW" in r["decision"] else "")
-                + "\n\n" + "\n".join(f"- {x}" for x in r["reasons"]))
-            st.markdown("**Probability of each stage**")
-            st.bar_chart(pd.DataFrame({"probability": r["probs"]},
-                                      index=[f"{i} - {n}" for i, n in enumerate(CLASS_NAMES)]),
-                         horizontal=True, height=220)
+            k = r["stage"]
+            color = STAGE_COLORS[k]
+            review = "REVIEW" in r["decision"]
+            dr_yes = r["dr_prob"] >= 0.5
+            unsure = r["entropy"] > CFG["entropy_threshold"]
+            # --- result card: stage, plain explanation and three small tiles ---
+            st.markdown(f"""
+<div class="card" style="border-left: 8px solid {color};">
+  <div class="muted">Predicted stage</div>
+  <div class="stage-name" style="color:{color};">{html.escape(CLASS_NAMES[k])}</div>
+  <div>{STAGE_TEXT[k]}</div>
+  <div class="tiles">
+    <div class="tile"><div class="t">Signs of DR</div>
+      <div class="v" style="color:{'#c62828' if dr_yes else '#2e7d32'};">{'Yes' if dr_yes else 'No'}</div>
+      <div class="muted">{r['dr_prob']:.0%} likely</div></div>
+    <div class="tile"><div class="t">Model confidence</div>
+      <div class="v">{r['probs'][k]:.0%}</div><div class="muted">for this stage</div></div>
+    <div class="tile"><div class="t">Uncertainty</div>
+      <div class="v" style="color:{'#ef6c00' if unsure else '#2e7d32'};">{r['entropy']:.2f}</div>
+      <div class="muted">0 = sure, 1 = unsure</div></div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+            # --- suggested action, coloured by urgency ---
+            urgent = "Refer (urgent)" in r["decision"]
+            refer = "Refer" in r["decision"]
+            a_col, a_bg = (("#c62828", "#fdecea") if urgent else
+                           ("#ef6c00", "#fff4e5") if (refer or review) else ("#2e7d32", "#edf7ed"))
+            action = html.escape(r["decision"].replace(" + HUMAN GRADER REVIEW", ""))
+            extra = "<div><b>Please have this checked by a specialist.</b></div>" if review else ""
+            reasons = "".join(f"<li>{html.escape(x)}</li>" for x in r["reasons"])
+            st.markdown(f"""
+<div class="action" style="background:{a_bg}; border-color:{a_col};">
+  <h4 style="color:{a_col};">Suggested action: {action}</h4>{extra}<ul>{reasons}</ul>
+</div>""", unsafe_allow_html=True)
+            if r["warnings"]:
+                st.warning("Image quality: " + "; ".join(r["warnings"]))
+
+            # --- probability of every stage as coloured bars ---
+            bars = "".join(
+                f'<div class="bar-row"><div class="bar-label">{"<b>" if i == k else ""}{i} - {html.escape(n)}'
+                f'{"</b>" if i == k else ""}</div><div class="bar-track"><div class="bar-fill" '
+                f'style="width:{p * 100:.1f}%; background:{STAGE_COLORS[i]};"></div></div>'
+                f'<div class="bar-pct">{p:.0%}</div></div>'
+                for i, (n, p) in enumerate(zip(CLASS_NAMES, r["probs"])))
+            st.markdown(f'<div class="card"><b>Probability of each stage</b>{bars}</div>', unsafe_allow_html=True)
             st.download_button("Download screening report", make_report(r),
                                file_name=f"dr_report_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt")
 
@@ -358,7 +430,7 @@ if image is not None and not r["rejected"]:
         c2.image(r["overlay"], caption="Grad-CAM: red areas influenced the result most", width="stretch")
 
 st.divider()
-st.subheader("3. Ask about your result")
+section(3, "Ask about your result")
 if image is None or r["rejected"]:
     st.info("Analyse a fundus image first, then you can ask questions about the result here.")
 elif not get_secret("GEMINI_API_KEY"):
