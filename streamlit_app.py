@@ -12,6 +12,7 @@ import os
 import json
 import datetime
 import hashlib
+import sys
 
 import numpy as np
 import pandas as pd
@@ -24,7 +25,7 @@ import dr_core as core
 core = importlib.reload(core)        # always use the latest dr_core.py after a redeploy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-st.set_page_config(page_title="DR Stage Screening", page_icon="", layout="wide")
+st.set_page_config(page_title="DR Stage Screening", layout="wide")
 
 
 def _mtime(name):
@@ -84,7 +85,9 @@ def make_report(r):
     return "\n".join(lines)
 
 
-
+# ------------------------------- AI assistant (Gemini) ----------------------
+# The assistant only receives the NUMBERS of the current result (never the image),
+# and strict instructions so it explains the result instead of diagnosing.
 CHAT_MODEL_DEFAULT = "gemini-2.5-flash"
 SYSTEM_PROMPT = """You are a friendly assistant inside a university research prototype for
 diabetic retinopathy (DR) screening. Rules:
@@ -143,50 +146,124 @@ def result_context(r):
     ])
 
 
+# models are tried in this order until one works; the "latest" aliases always point to
+# Google's current Flash models, so the app keeps working when old model names are retired
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+
+def friendly_error(err):
+    """Turn a Gemini error into a short message the user can act on."""
+    e = str(err)
+    if "API_KEY_INVALID" in e or "API key not valid" in e:
+        return "The API key is not valid. Please check GEMINI_API_KEY in the app secrets."
+    if "429" in e or "RESOURCE_EXHAUSTED" in e:
+        return "The free usage limit was reached. Please wait a minute and try again."
+    if "PERMISSION_DENIED" in e or "403" in e:
+        return "The API key has no permission for the Gemini API (check the key's project in Google AI Studio)."
+    if "location is not supported" in e.lower() or "FAILED_PRECONDITION" in e:
+        return "The Gemini API is not available for this key's region or project."
+    return "The assistant could not be reached right now. Please try again in a moment."
+
+
+# models tried in this order (Google retires model names over time, so there is a fallback)
+PREFERRED_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest",
+                    "gemini-flash-lite-latest", "gemini-2.0-flash"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def discover_flash_models(api_key):
+    """Ask Google which 'flash' text models this API key can use right now."""
+    try:
+        found = []
+        for m in get_chat_client(api_key).models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if ("generateContent" in actions and "flash" in name
+                    and not any(x in name for x in ("image", "tts", "audio", "live", "embedding"))):
+                found.append(name)
+        return found
+    except Exception as e:
+        print("Model discovery failed:", repr(e))
+        return []
+
+
+def explain_error(e):
+    """Turn an API error into a short, understandable message (full error goes to the logs)."""
+    text, code = str(e), getattr(e, "code", None)
+    if "API_KEY_INVALID" in text or "API key not valid" in text:
+        return "The API key is not valid. Please check GEMINI_API_KEY in the app secrets."
+    if code == 403 or "PERMISSION_DENIED" in text:
+        return "This API key is not allowed to use Gemini (permission denied)."
+    if code == 429 or "RESOURCE_EXHAUSTED" in text:
+        return "The assistant is busy right now (free usage limit reached). Please try again in a minute."
+    return f"Sorry, the assistant is not available at the moment (error {code or 'unknown'})."
+
+
 def ask_assistant(question, history, r):
     """Send the question, the recent conversation and the result context to Gemini."""
     from google.genai import types
-    client = get_chat_client(get_secret("GEMINI_API_KEY"))
+    api_key = get_secret("GEMINI_API_KEY")
+    client = get_chat_client(api_key)
     contents = [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
                 for m in history[-10:]]                 # last 5 question/answer pairs only
     contents.append({"role": "user", "parts": [{"text": question}]})
-    try:
-        resp = client.models.generate_content(
-            model=get_secret("GEMINI_MODEL", CHAT_MODEL_DEFAULT),
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT + "\n\n" + result_context(r),
-                temperature=0.3, max_output_tokens=1024))
-        answer = (resp.text or "").strip()
-        return answer or "Sorry, I could not create an answer. Please try asking in a different way."
-    except Exception as e:
-        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            return "The assistant is busy right now (free usage limit reached). Please try again in a minute."
-        return "Sorry, the assistant is not available at the moment. Please try again later."
+    config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT + "\n\n" + result_context(r),
+                                         temperature=0.3, max_output_tokens=1024)
+
+    # the model that worked last time first, then the configured one, preferred ones and discovered ones
+    candidates = [st.session_state.get("working_model"), get_secret("GEMINI_MODEL")] + PREFERRED_MODELS
+    candidates = [m for i, m in enumerate(candidates) if m and m not in candidates[:i]]
+    last_error = None
+    for attempt in (1, 2):
+        for model in candidates:
+            try:
+                resp = client.models.generate_content(model=model, contents=contents, config=config)
+                st.session_state["working_model"] = model
+                answer = (resp.text or "").strip()
+                return answer or "Sorry, I could not create an answer. Please try asking in a different way."
+            except Exception as e:
+                print(f"Gemini error with model {model}:", repr(e))      # visible in 'Manage app' -> logs
+                last_error = e
+                text = str(e)
+                # a wrong / retired model name or a model without free quota -> try the next one
+                if getattr(e, "code", None) == 404 or "NOT_FOUND" in text or "limit: 0" in text:
+                    continue
+                return explain_error(e)
+        if attempt == 1:                                 # none worked: ask Google which models exist
+            extra = [m for m in discover_flash_models(api_key) if m not in candidates]
+            if not extra:
+                break
+            candidates = extra
+    return explain_error(last_error) if last_error else "Sorry, no Gemini model is available for this key."
 
 
-
+# ------------------------------- user interface ------------------------------
 st.title("Diabetic Retinopathy Stage Screening")
 tm = CFG.get("test_metrics", {})
-st.caption(f"Transfer-learning **{CFG['backbone']}** with multi-task heads (stage + binary + ordinal), "
-           "test-time augmentation, Monte-Carlo-dropout uncertainty, Grad-CAM and automatic triage. "
-           f"Test QWK **{tm.get('qwk', float('nan')):.3f}** · macro-F1 **{tm.get('macro_f1', float('nan')):.3f}** "
-           f"· accuracy **{tm.get('acc', float('nan')):.3f}**")
+st.markdown("Check a retinal (fundus) photo for signs of diabetic retinopathy in three simple steps: "
+            "**1. choose an image**, **2. read the result**, **3. ask questions** about it.")
+with st.expander("About the model"):
+    st.markdown(f"Transfer-learning **{CFG['backbone']}** network with three outputs (stage, DR yes/no and "
+                "stage order), trained on the APTOS 2019 dataset. Each image is checked 20 times "
+                "(4 flips x Monte-Carlo dropout) to measure how sure the model is, and Grad-CAM shows where "
+                f"it looked. Test results: accuracy **{tm.get('acc', float('nan')):.3f}**, "
+                f"macro-F1 **{tm.get('macro_f1', float('nan')):.3f}**, QWK **{tm.get('qwk', float('nan')):.3f}**.")
 
 with st.sidebar:
     st.header("How it works")
-    st.markdown("1. Image-quality gate\n2. Crop + enhancement (CLAHE, mask-aware Ben Graham)\n"
-                "3. CNN prediction (4 flips × Monte-Carlo dropout)\n4. Uncertainty + triage\n"
-                "5. Grad-CAM explanation\n6. AI assistant (Gemini) explains the result")
+    st.markdown("1. Image-quality check\n2. Image enhancement (CLAHE, mask-aware Ben Graham)\n"
+                "3. CNN prediction with uncertainty\n4. Suggested follow-up (triage)\n"
+                "5. Grad-CAM explanation\n6. AI assistant explains the result")
     st.markdown(DISCLAIMER)
 
 ex_dir = os.path.join(BASE_DIR, "examples")
 examples = sorted(os.listdir(ex_dir)) if os.path.isdir(ex_dir) else []
 
-col_in, col_out = st.columns([1, 1.3])
+col_in, col_out = st.columns([1, 1.3], gap="large")
 with col_in:
-    uploaded = st.file_uploader("Upload a colour fundus image", type=["png", "jpg", "jpeg"])
-    example = st.selectbox("...or try an example image", ["(none)"] + examples)
+    st.subheader("1. Choose an image")
+    uploaded = st.file_uploader("Upload a colour fundus photo (PNG or JPG)", type=["png", "jpg", "jpeg"])
+    example = st.selectbox("Or try an example image", ["(none)"] + examples)
     image = None
     if uploaded is not None:
         data = np.frombuffer(uploaded.getvalue(), np.uint8)
@@ -195,78 +272,93 @@ with col_in:
     elif example != "(none)":
         image = core.load_rgb(os.path.join(ex_dir, example))
     if image is not None:
-        st.image(image, caption="Input image", width="stretch")
+        st.image(image, caption="Your image", width="stretch")
 
 with col_out:
+    st.subheader("2. Result")
     if image is None:
-        st.info("Upload an image or pick an example to start.")
+        st.info("Upload an image or pick an example on the left to see the result here.")
     else:
         # run the model only when a NEW image is chosen; chat messages reuse the stored result
         img_key = hashlib.md5(image.tobytes()).hexdigest()
         if st.session_state.get("img_key") != img_key:
-            with st.spinner("Analysing (quality check, prediction, uncertainty, Grad-CAM) ..."):
+            with st.spinner("Analysing the image ..."):
                 st.session_state["result"] = analyze(image)
             st.session_state["img_key"] = img_key
             st.session_state["chat"] = []               # new image -> new conversation
         r = st.session_state["result"]
         if r["rejected"]:
             q = r["quality"]
-            st.error(f"Image rejected: this does not look like a retinal fundus photograph "
-                     f"(retina coverage {q['coverage']:.0%}, red/blue ratio {q['red_ratio']:.2f}).")
+            st.error("This does not look like a retinal (fundus) photo, so it was not analysed. "
+                     "Please upload a colour photo of the back of the eye.\n\n"
+                     f"Details: retina area {q['coverage']:.0%}, red/blue ratio {q['red_ratio']:.2f}.")
         else:
-            st.subheader(f"Predicted stage: {CLASS_NAMES[r['stage']]} ({r['probs'][r['stage']]:.1%})")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("DR present (binary head)", "Yes" if r["dr_prob"] >= 0.5 else "No", f"p = {r['dr_prob']:.2f}",
-                      delta_color="off")
-            m2.metric("Uncertainty", f"{r['entropy']:.2f}", f"threshold {CFG['entropy_threshold']:.2f}",
-                      delta_color="off")
-            m3.metric("Image quality", "OK" if not r["warnings"] else "Warning")
+            with st.container(border=True):
+                st.markdown(f"#### Predicted stage: {CLASS_NAMES[r['stage']]}")
+                st.caption(f"Model confidence for this stage: {r['probs'][r['stage']]:.0%}")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Signs of DR", "Yes" if r["dr_prob"] >= 0.5 else "No",
+                          help=f"Probability that any DR is present: {r['dr_prob']:.0%}")
+                m2.metric("Uncertainty", f"{r['entropy']:.2f}",
+                          help=f"0 = very sure, 1 = completely unsure. Above {CFG['entropy_threshold']:.2f} "
+                               "the case is sent for human review.")
+                m3.metric("Image quality", "Good" if not r["warnings"] else "Check",
+                          help="; ".join(r["warnings"]) if r["warnings"] else "No quality problems found.")
+            box = st.warning if "REVIEW" in r["decision"] or "urgent" in r["decision"] else st.success
+            box(f"**Suggested action:** {r['decision'].replace(' + HUMAN GRADER REVIEW', '')}"
+                + (" - please have this checked by a specialist" if "REVIEW" in r["decision"] else "")
+                + "\n\n" + "\n".join(f"- {x}" for x in r["reasons"]))
+            st.markdown("**Probability of each stage**")
             st.bar_chart(pd.DataFrame({"probability": r["probs"]},
                                       index=[f"{i} - {n}" for i, n in enumerate(CLASS_NAMES)]),
-                         horizontal=True)
-            box = st.warning if "REVIEW" in r["decision"] or "urgent" in r["decision"] else st.success
-            box(f"**Suggested action:** {r['decision']}\n\n" + "\n".join(f"- {x}" for x in r["reasons"]))
+                         horizontal=True, height=220)
             st.download_button("Download screening report", make_report(r),
                                file_name=f"dr_report_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt")
 
 if image is not None and not r["rejected"]:
-    c1, c2 = st.columns(2)
-    c1.image(r["proc"], caption="Model input (after preprocessing)", width="stretch")
-    c2.image(r["overlay"], caption="Grad-CAM: regions driving the decision", width="stretch")
+    with st.expander("See what the model looked at", expanded=True):
+        c1, c2 = st.columns(2)
+        c1.image(r["proc"], caption="Enhanced image used by the model", width="stretch")
+        c2.image(r["overlay"], caption="Grad-CAM: red areas influenced the result most", width="stretch")
 
-st.markdown("---")
-st.subheader("💬 Ask the AI assistant about this result")
+st.divider()
+st.subheader("3. Ask about your result")
 if image is None or r["rejected"]:
     st.info("Analyse a fundus image first, then you can ask questions about the result here.")
 elif not get_secret("GEMINI_API_KEY"):
     st.info("The AI assistant is not configured (add GEMINI_API_KEY to the app secrets).")
 else:
-    st.caption("Powered by Google Gemini. It explains this result in simple words but cannot diagnose "
-               "and does not replace an eye doctor. Only the numbers shown above are shared with it - "
-               "never your image.")
+    st.caption("The assistant (Google Gemini) explains this result in simple words. It cannot diagnose and "
+               "does not replace an eye doctor. Only the numbers shown above are shared with it - never your image.")
     chat = st.session_state.setdefault("chat", [])
-    quick = ["What does my result mean?", "Why was this action suggested?",
-             "What does the uncertainty value mean?", "What should I do next?"]
+    quick = ["What does my result mean?", "Why this suggested action?",
+             "What does uncertainty mean?", "What should I do next?"]
     pending = None
     for col, q in zip(st.columns(len(quick)), quick):
         if col.button(q, width="stretch"):
             pending = q
-    for m in chat:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+    box = st.container(border=True)
+    with box:
+        if not chat and not pending:
+            st.caption("Choose a question above or type your own below.")
+        for m in chat:
+            with st.chat_message(m["role"], avatar=":material/person:" if m["role"] == "user"
+                                 else ":material/support_agent:"):
+                st.markdown(m["content"])
     typed = st.chat_input("Type your question about the result", max_chars=500)
     question = typed or pending
     if question:
-        with st.chat_message("user"):
-            st.markdown(question)
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking ..."):
-                answer = ask_assistant(question, chat, r)
-            st.markdown(answer)
+        with box:
+            with st.chat_message("user", avatar=":material/person:"):
+                st.markdown(question)
+            with st.chat_message("assistant", avatar=":material/support_agent:"):
+                with st.spinner("Thinking ..."):
+                    answer = ask_assistant(question, chat, r)
+                st.markdown(answer)
         chat += [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
     if chat and st.button("Clear conversation"):
         st.session_state["chat"] = []
         st.rerun()
 
-st.markdown("---")
-st.markdown(DISCLAIMER)
+st.divider()
+st.caption(DISCLAIMER)
