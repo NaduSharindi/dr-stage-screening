@@ -5,4 +5,4 @@ opencv-python-headless
 numpy
 pandas
 pillow
-google-genai
+google-genai>=2.27.0
