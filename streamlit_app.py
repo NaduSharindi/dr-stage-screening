@@ -52,11 +52,35 @@ DISCLAIMER = ("**Disclaimer:** research and education prototype built for a univ
               "Always consult a qualified eye-care professional.")
 
 
+def looks_like_fundus(img):
+    """Shape check added after testing with everyday photos: every fundus photo shows a round,
+    bright retina on a black background, so the corners are dark and the bright area is round.
+    Returns (ok, reason)."""
+    h, w = img.shape[:2]
+    s = 256 / max(h, w)                                  # keep the aspect ratio (no squashing)
+    gray = cv2.cvtColor(cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s)))), cv2.COLOR_RGB2GRAY)
+    k = max(8, int(min(gray.shape) * 0.06))              # small square in every corner
+    corners = [gray[:k, :k], gray[:k, -k:], gray[-k:, :k], gray[-k:, -k:]]
+    if sum(c.mean() < 40 for c in corners) < 3:          # allow one corner with a small artefact
+        return False, "it has no dark border (fundus photos show a round retina on a black background)"
+    mask = cv2.morphologyEx((gray > 10).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    if mask.mean() < 0.25:
+        return False, "the bright area is too small"
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c = max(contours, key=cv2.contourArea)
+    (_, _), r = cv2.minEnclosingCircle(c)
+    roundness = cv2.contourArea(c) / (np.pi * r * r + 1e-6)   # 1.0 = perfect circle
+    if roundness < 0.6:
+        return False, "the bright area is not round like a retina"
+    return True, ""
+
+
 def analyze(image):
     """Run the full screening pipeline on one RGB uint8 image. Returns a result dict."""
+    shape_ok, reason = looks_like_fundus(image)
     is_fundus, warnings, qm = core.quality_gate(image, CFG["quality_thresholds"])
-    if not is_fundus:
-        return {"rejected": True, "quality": qm}
+    if not shape_ok or not is_fundus:
+        return {"rejected": True, "quality": qm, "reason": reason or "its colour and size do not match a retina photo"}
 
     proc = core.prepare_input(image, CFG["img_size"], CFG.get("input_mode", "enhanced"))
     x = PREPROCESS(proc.astype("float32")[None].copy())
@@ -375,7 +399,7 @@ with col_out:
             q = r["quality"]
             st.error("This does not look like a retinal (fundus) photo, so it was not analysed. "
                      "Please upload a colour photo of the back of the eye.\n\n"
-                     f"Details: retina area {q['coverage']:.0%}, red/blue ratio {q['red_ratio']:.2f}.")
+                     f"Reason: {r.get('reason', 'it does not match a retina photo')}.")
         else:
             k = r["stage"]
             color = STAGE_COLORS[k]
